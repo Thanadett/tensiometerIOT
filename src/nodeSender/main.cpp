@@ -42,9 +42,8 @@
  *  ──────────────────────────────────────────────
  *  0  –  10 cbar : Saturated / waterlogged
  *  10 – 30 cbar  : Field capacity (ideal after irrigation)
- *  30 – 60 cbar  : Optimal range for most crops
- *  60 – 80 cbar  : Stress begins — irrigate soon
- *  > 80 cbar     : Severe stress — irrigate immediately
+ *  30 – 50 cbar  : Optimal range for most crops
+ *  > 50 cbar     : Severe stress — irrigate immediately
  * ============================================================
  */
 
@@ -255,10 +254,8 @@ static const char *soil_status(float cbar)
     return "SATURATED";
   if (cbar < 30)
     return "FIELD_CAPACITY";
-  if (cbar < 60)
+  if (cbar < 50)
     return "OPTIMAL";
-  if (cbar < 80)
-    return "STRESS_SOON";
   return "IRRIGATE_NOW";
 }
 

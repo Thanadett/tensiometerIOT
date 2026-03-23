@@ -2,15 +2,18 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+
+void sendToSheet(String id, int ts, int pkt, float cbar, float kpa, float vout, String status);
 
 // ================= WiFi =================
 const char *ssid = "@JumboPlusIoT";
 const char *password = "tensiometer";
 
 // ================= Google Script =================
-const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw9K2NIVjlnWoMehJeh6RBJbwIAwIz-vkG1OUlSYJQQUw5v8b3xtSvQ2jybB2HFzQM9/exec";
+const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzfP2i5CG9oVMwXx1hXi_opYPGzq0RWdhc-TvGWAeMijKWAuSNJytxU-CSdVqTmjMH7Mw/exec";
 
 // ================= LoRa =================
 #define SS 5
@@ -27,12 +30,22 @@ void setup()
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting WiFi");
-  while (WiFi.status() != WL_CONNECTED)
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi Connected");
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\nWiFi Connected");
+  }
+  else
+  {
+    Serial.println("\nWiFi FAILED");
+  }
 
   // ----- LoRa -----
   SPI.begin();
@@ -48,6 +61,7 @@ void setup()
   LoRa.setSpreadingFactor(10);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setTxPower(17);
+  LoRa.setSyncWord(0xF3); // 🔥 สำคัญ
 
   Serial.println("✅ Receiver Ready");
 }
@@ -59,7 +73,6 @@ void loop()
 
   if (packetSize)
   {
-
     String received = "";
 
     while (LoRa.available())
@@ -97,41 +110,48 @@ void loop()
     // -------- Send to Google Sheet --------
     sendToSheet(id, ts, pkt, cbar, kpa, vout, status);
   }
+
+  delay(10);
 }
 
 // ================= HTTP POST =================
 void sendToSheet(String id, int ts, int pkt, float cbar, float kpa, float vout, String status)
 {
-
   if (WiFi.status() != WL_CONNECTED)
   {
     Serial.println("WiFi lost, reconnecting...");
     WiFi.reconnect();
+    delay(2000);
     return;
   }
 
+  WiFiClientSecure client;
+  client.setInsecure();
+
   HTTPClient http;
-  http.begin(SCRIPT_URL);
-  http.addHeader("Content-Type", "application/json");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  // 🔥 JSON ที่จะส่งไป Google Sheet
-  String json = "{";
-  json += "\"id\":\"" + id + "\",";
-  json += "\"ts\":" + String(ts) + ",";
-  json += "\"pkt\":" + String(pkt) + ",";
-  json += "\"cbar\":" + String(cbar, 2) + ",";
-  json += "\"kpa\":" + String(kpa, 2) + ",";
-  json += "\"vout\":" + String(vout, 3) + ",";
-  json += "\"status\":\"" + status + "\"";
-  json += "}";
+  String url = String(SCRIPT_URL) +
+               "?id=" + id +
+               "&ts=" + String(ts) +
+               "&pkt=" + String(pkt) +
+               "&cbar=" + String(cbar, 2) +
+               "&kpa=" + String(kpa, 2) +
+               "&vout=" + String(vout, 3) +
+               "&status=" + status;
 
-  Serial.println("📤 POST:");
-  Serial.println(json);
+  Serial.println("📤 GET:");
+  Serial.println(url);
 
-  int httpCode = http.POST(json);
+  http.begin(client, url);
+
+  int httpCode = http.GET();
 
   Serial.print("HTTP Response: ");
   Serial.println(httpCode);
+
+  String payload = http.getString();
+  Serial.println(payload);
 
   http.end();
 }
