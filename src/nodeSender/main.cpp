@@ -1,126 +1,78 @@
-/**
- * ============================================================
- *  Tensiometer — ESP32 + LoRa (SX1276) + MPX5050 + VDiv
- * ============================================================
- *
- *  Hardware Wiring
- *  ───────────────
- *  MPX5050 (Vcc=5V, Vout → Voltage Divider → ESP32 ADC)
- *    MPX5050 Pin 1 (Vout) ── R1(10kΩ) ──┬── R2(10kΩ) ── GND
- *                                         └── GPIO34 (ADC1_CH6)
- *    MPX5050 Pin 2 (GND)  ── GND
- *    MPX5050 Pin 3 (Vcc)  ── 5V
- *
- *  Voltage Divider: Vout_max(MPX5050)=4.7V → ADC ~2.35V (safe for 3.3V ADC)
- *  Divider ratio = R2/(R1+R2) = 0.5  → multiply ADC reading × 2
- *
- *  LoRa SX1276 (3.3V)
- *    NSS  ── GPIO5
- *    MOSI ── GPIO23
- *    MISO ── GPIO19
- *    SCK  ── GPIO18
- *    RST  ── GPIO14
- *    DIO0 ── GPIO26
- *
- *  MPX5050 Specs
- *  ─────────────
- *  Range     :  0 – 50 kPa (measures vacuum magnitude from tensiometer)
- *  Vout      :  0.2V (0 kPa) – 4.7V (50 kPa)
- *  Supply    :  5V ± 0.25V
- *  Formula   :  raw_kPa = (Vout - Vmin - ZERO_OFFSET) / (Vmax - Vmin) * 50
- *  Sign      :  tensiometer = vacuum → soil_tension = -raw_kPa  (negative pressure)
- *              → report as positive cbar: soil_tension_cbar = abs(raw_kPa)
- *
- *  Calibration
- *  ───────────
- *  Each MPX5050 has a unique zero-offset. Measure Vout with sensor open
- *  to atmosphere (0 kPa), then set ZERO_OFFSET = Vout_measured - 0.20
- *  Example: if Vout@0kPa = 0.23V → ZERO_OFFSET = 0.03f
- *  This reduces error from ±5 kPa → ±1 kPa
- *
- *  Soil Tension Interpretation (centibars = kPa)
- *  ──────────────────────────────────────────────
- *  0  –  10 cbar : Saturated / waterlogged
- *  10 – 30 cbar  : Field capacity (ideal after irrigation)
- *  30 – 50 cbar  : Optimal range for most crops
- *  > 50 cbar     : Severe stress — irrigate immediately
- * ============================================================
- */
-
 #include <Arduino.h>
-#include <ArduinoJson.h> // https://arduinojson.org/
+#include <ArduinoJson.h>
+#include <esp_sleep.h>
 
-// ─── LoRa Enable ────────────────────────────────────────────
-// 1 = LoRa module plugged in → transmit JSON every LORA_SEND_INTERVAL
-// 0 = no module → sensor-only mode, Serial output only
 #define ENABLE_LORA 1
 
 #if ENABLE_LORA
 #include <SPI.h>
-#include <LoRa.h> // https://github.com/sandeepmistry/arduino-LoRa
+#include <LoRa.h>
 #endif
 
 // ─── Pin Definitions ────────────────────────────────────────
-#define ADC_PIN 34 // GPIO34 — ADC1_CH6 (input-only, no pull-up)
+#define ADC_PIN_S1 34 // Sensor 1 (ความลึก 40 cm)
+#define ADC_PIN_S2 35 // Sensor 2 (ความลึก 60 cm)
 #define LORA_NSS 5
 #define LORA_RST 14
 #define LORA_DIO0 26
 
-// ─── ADC & Voltage Divider ──────────────────────────────────
-// analogReadMilliVolts() used — no manual ADC_MAX/VREF needed
-#define ADC_ATTEN ADC_11db // allows 0–3.6V input range
-#define VDIV_RATIO 2.0f    // × 2 to recover original Vout from divider
+// ─── ADC ─────────────────────────────────────────────────────
+#define ADC_ATTEN ADC_11db // 0–3.6V range
+#define VDIV_RATIO 1.667f  // Vout voltage divider
 
 // ─── MPX5050 Transfer Function ──────────────────────────────
-#define MPX_VOUT_MIN 0.20f // V at 0 kPa (nominal)
-#define MPX_VOUT_MAX 4.70f // V at 50 kPa
+#define MPX_VOUT_MIN 0.20f // V ที่ 0 kPa
+#define MPX_VOUT_MAX 4.70f // V ที่ 50 kPa
 #define MPX_P_MAX 50.0f    // kPa full scale
 
-// ─── Sensor Calibration ─────────────────────────────────────
-// HOW TO CALIBRATE:
-//   1. Disconnect porous cup — leave sensor open to atmosphere (0 kPa)
-//   2. Read Vout from Serial: "[SENS] Vout=X.XXXV"
-//   3. ZERO_OFFSET = Vout_measured - 0.20
-//
-// Your sensor measured Vout=0.284V at ~0 kPa:
-//   ZERO_OFFSET = 0.284 - 0.20 = 0.084V  ← set below
-//
-// Note: analogReadMilliVolts() already includes ADC nonlinearity correction,
-// so Vout here is the actual voltage AFTER the voltage divider × 2.
-#define ZERO_OFFSET 0.084f // V  ← derived from your Vout=0.284V reading
+// ─── Calibration (ตั้งค่าแยกสำหรับแต่ละตัว) ────────────────
+#define ZERO_OFFSET_S1 0.037f // ← sensor ตัวที่ 1
+#define ZERO_OFFSET_S2 0.037f // ← sensor ตัวที่ 2
 
-// ─── Filtering Parameters ───────────────────────────────────
-#define SAMPLE_N 16        // Samples per reading (median filter window)
-#define EMA_ALPHA 0.15f    // EMA smoothing factor (lower = smoother, slower)
-#define OUTLIER_SIGMA 2.5f // Reject samples > N×σ from mean
+// ─── ความลึกของ Sensor ──────────────────────────────────────
+#define DEPTH_CM_S1 40 // cm
+#define DEPTH_CM_S2 60 // cm
+
+// ─── Filtering ──────────────────────────────────────────────
+#define SAMPLE_N 16        // จำนวน sample ต่อการอ่าน
+#define EMA_ALPHA 0.15f    // EMA factor
+#define OUTLIER_SIGMA 2.5f // ตัดค่า outlier เกิน N×σ
 
 // ─── Timing ─────────────────────────────────────────────────
-#define SAMPLE_INTERVAL_MS 5000  // Read sensor every 5 s
-#define LORA_SEND_INTERVAL 60000 // Transmit via LoRa every 60 s
+#define SLEEP_DURATION_S 3600ULL // วินาที (1 ชั่วโมง)
 
 // ─── LoRa Settings ──────────────────────────────────────────
 #define LORA_FREQUENCY 433E6
-#define LORA_SF 10       // Spreading Factor (7–12)
-#define LORA_BW 125E3    // Bandwidth (Hz)
-#define LORA_CR 5        // Coding Rate (5=4/5)
-#define LORA_TX_POWER 17 // dBm
+#define LORA_SF 10
+#define LORA_BW 125E3
+#define LORA_CR 5
+#define LORA_TX_POWER 17
+#define LORA_SYNC_WORD 0xF3
 
 // ─── Device Identity ────────────────────────────────────────
 #define DEVICE_ID "TENS-01"
 
 // ════════════════════════════════════════════════════════════
-//  Globals
+//  RTC Memory
 // ════════════════════════════════════════════════════════════
-static float g_ema_pressure = NAN; // EMA accumulator (NAN = uninitialised)
-static float g_last_cbar = 0.0f;
-static uint32_t g_last_sample_ms = 0;
-#if ENABLE_LORA
-static uint32_t g_last_lora_ms = 0;
-static uint32_t g_packet_count = 0;
-#endif
+RTC_DATA_ATTR static uint32_t g_packet_count = 0; // นับ packet ทั้งหมด
+RTC_DATA_ATTR static uint32_t g_boot_count = 0;   // นับครั้งที่ตื่น
+RTC_DATA_ATTR static float g_ema_s1 = NAN;        // EMA sensor 1
+RTC_DATA_ATTR static float g_ema_s2 = NAN;        // EMA sensor 2
 
 // ════════════════════════════════════════════════════════════
-//  Utility: Insertion Sort (in-place, ascending)
+//  Struct: ผลลัพธ์ต่อ sensor หนึ่งตัว
+// ════════════════════════════════════════════════════════════
+struct SensorReading
+{
+  float vout;    // V  (หลัง voltage divider × 2)
+  float kpa;     // kPa (negative = vacuum)
+  float tension; // cbar (positive, = fabsf(kpa))
+  float cbar;    // cbar หลัง EMA smooth
+};
+
+// ════════════════════════════════════════════════════════════
+//  Utility: Insertion Sort
 // ════════════════════════════════════════════════════════════
 static void insertion_sort(float *arr, uint8_t n)
 {
@@ -138,28 +90,26 @@ static void insertion_sort(float *arr, uint8_t n)
 }
 
 // ════════════════════════════════════════════════════════════
-//  ADC → Voltage (with multi-sample median + outlier rejection)
+//  ADC → Vout  (median + outlier rejection)
 // ════════════════════════════════════════════════════════════
-static float read_adc_voltage()
+static float read_adc_voltage(uint8_t pin)
 {
   float samples[SAMPLE_N];
 
-  // 1. Collect samples — use analogReadMilliVolts() for better ESP32 ADC linearity
-  //    (~3× more accurate than raw analogRead due to internal nonlinearity correction)
+  // เก็บ sample
   for (uint8_t i = 0; i < SAMPLE_N; i++)
   {
-    float mv = (float)analogReadMilliVolts(ADC_PIN); // mV, already linearised
-    samples[i] = mv / 1000.0f;                       // convert to V
+    samples[i] = (float)analogReadMilliVolts(pin) / 1000.0f;
     delayMicroseconds(500);
   }
 
-  // 2. Compute mean and std-dev for outlier detection
-  float sum = 0.0f;
+  // mean + σ
+  float sum = 0;
   for (uint8_t i = 0; i < SAMPLE_N; i++)
     sum += samples[i];
   float mean = sum / SAMPLE_N;
 
-  float var = 0.0f;
+  float var = 0;
   for (uint8_t i = 0; i < SAMPLE_N; i++)
   {
     float d = samples[i] - mean;
@@ -167,86 +117,50 @@ static float read_adc_voltage()
   }
   float sigma = sqrtf(var / SAMPLE_N);
 
-  // 3. Reject outliers (replace with mean)
-  uint8_t valid_n = 0;
-  float valid_sum = 0.0f;
-  for (uint8_t i = 0; i < SAMPLE_N; i++)
-  {
-    if (fabsf(samples[i] - mean) <= OUTLIER_SIGMA * sigma)
-    {
-      valid_sum += samples[i];
-      valid_n++;
-    }
-  }
-
-  // 4. Sort remaining valid samples → median
+  // กรอง outlier + median
   float valid[SAMPLE_N];
   uint8_t idx = 0;
   for (uint8_t i = 0; i < SAMPLE_N; i++)
   {
     if (fabsf(samples[i] - mean) <= OUTLIER_SIGMA * sigma)
-    {
       valid[idx++] = samples[i];
-    }
   }
-
   if (idx == 0)
-    return mean * VDIV_RATIO; // fallback
+    return mean * VDIV_RATIO;
 
   insertion_sort(valid, idx);
   float median = (idx % 2 == 0)
                      ? (valid[idx / 2 - 1] + valid[idx / 2]) * 0.5f
                      : valid[idx / 2];
 
-  // 5. Restore original Vout (undo voltage divider)
-  return median * VDIV_RATIO;
+  return median * VDIV_RATIO; // recover Vout จริง
 }
 
 // ════════════════════════════════════════════════════════════
-//  Vout → Soil Tension (kPa)
-//
-//  MPX5050 measures vacuum magnitude (positive output).
-//  Tensiometer physics: soil tension = NEGATIVE pressure.
-//
-//  Steps:
-//    1. Apply zero-offset calibration
-//    2. Map Vout → raw_kPa (0..50, positive)
-//    3. Invert sign → negative pressure (vacuum)
-//    4. Caller uses fabsf() to get soil tension in cbar
+//  Vout → kPa  (negative = vacuum = soil tension)
 // ════════════════════════════════════════════════════════════
-static float voltage_to_kpa(float vout)
+static float voltage_to_kpa(float vout, float zero_offset)
 {
-  // 1. Calibrated Vout (subtract sensor-specific zero-offset)
-  float vout_cal = vout - ZERO_OFFSET;
-
-  // 2. MPX5050 transfer function → positive vacuum magnitude
+  float vout_cal = vout - zero_offset;
   float raw_kpa = (vout_cal - MPX_VOUT_MIN) / (MPX_VOUT_MAX - MPX_VOUT_MIN) * MPX_P_MAX;
   raw_kpa = constrain(raw_kpa, 0.0f, MPX_P_MAX);
-
-  // 3. Tensiometer = vacuum → negative pressure
-  return -raw_kpa;
+  return -raw_kpa; // negative = vacuum
 }
 
 // ════════════════════════════════════════════════════════════
-//  EMA (Exponential Moving Average) filter
-//  y[n] = α·x[n] + (1-α)·y[n-1]
-//  Input: soil_tension (positive cbar)
+//  EMA Update  (ใช้ pointer เพื่อแก้ไข g_ema_s1 / g_ema_s2 ใน RTC RAM)
 // ════════════════════════════════════════════════════════════
-static float ema_update(float new_val)
+static float ema_update(float *ema_state, float new_val)
 {
-  if (isnan(g_ema_pressure))
-  {
-    g_ema_pressure = new_val; // seed on first call
-  }
+  if (isnan(*ema_state))
+    *ema_state = new_val;
   else
-  {
-    g_ema_pressure = EMA_ALPHA * new_val + (1.0f - EMA_ALPHA) * g_ema_pressure;
-  }
-  return g_ema_pressure;
+    *ema_state = EMA_ALPHA * new_val + (1.0f - EMA_ALPHA) * (*ema_state);
+  return *ema_state;
 }
 
 // ════════════════════════════════════════════════════════════
-//  Soil status string from centibars
+//  Soil Status String
 // ════════════════════════════════════════════════════════════
 static const char *soil_status(float cbar)
 {
@@ -260,22 +174,81 @@ static const char *soil_status(float cbar)
 }
 
 // ════════════════════════════════════════════════════════════
-//  LoRa Transmit (JSON payload) — compiled only when ENABLE_LORA=1
+//  อ่าน Sensor ทั้งคู่ — return ผ่าน struct
+// ════════════════════════════════════════════════════════════
+static SensorReading read_sensor(uint8_t pin, float zero_offset, float *ema_state)
+{
+  SensorReading r;
+  r.vout = read_adc_voltage(pin);
+  r.kpa = voltage_to_kpa(r.vout, zero_offset);
+  r.tension = fabsf(r.kpa);
+  r.cbar = ema_update(ema_state, r.tension);
+  return r;
+}
+
+// ════════════════════════════════════════════════════════════
+//  LoRa Init
 // ════════════════════════════════════════════════════════════
 #if ENABLE_LORA
-static bool lora_send(float cbar, float vout, float kpa)
+static bool lora_init()
 {
-  StaticJsonDocument<256> doc;
-  doc["id"] = DEVICE_ID;
-  doc["ts"] = millis() / 1000UL; // seconds uptime
-  doc["pkt"] = ++g_packet_count;
-  doc["cbar"] = serialized(String(cbar, 2));
-  doc["kpa"] = serialized(String(kpa, 2));
-  doc["vout"] = serialized(String(vout, 3));
-  doc["status"] = soil_status(cbar);
+  SPI.begin();
+  delay(100);
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
 
-  char buf[256];
-  size_t len = serializeJson(doc, buf);
+  for (uint8_t i = 1; i <= 5; i++)
+  {
+    Serial.printf("[LoRa] Init %d/5...\r\n", i);
+    Serial.flush();
+    if (LoRa.begin(LORA_FREQUENCY))
+    {
+      LoRa.setSpreadingFactor(LORA_SF);
+      LoRa.setSignalBandwidth(LORA_BW);
+      LoRa.setCodingRate4(LORA_CR);
+      LoRa.setTxPower(LORA_TX_POWER);
+      LoRa.setSyncWord(LORA_SYNC_WORD);
+      Serial.printf("[LoRa] Ready @ %.0fMHz  SF%d  BW%.0fkHz\r\n",
+                    LORA_FREQUENCY / 1e6, LORA_SF, LORA_BW / 1e3);
+      Serial.flush();
+      return true;
+    }
+    delay(500);
+  }
+  Serial.println("[LoRa] INIT FAILED — check wiring!\r\n"
+                 "       NSS=5 MOSI=23 MISO=19 SCK=18 RST=14 DIO0=26");
+  Serial.flush();
+  return false;
+}
+
+// ════════════════════════════════════════════════════════════
+//  LoRa Send — JSON ที่มีข้อมูลทั้ง 2 sensor
+// ════════════════════════════════════════════════════════════
+static bool lora_send(const SensorReading &s1, const SensorReading &s2)
+{
+  StaticJsonDocument<512> doc;
+  doc["id"] = DEVICE_ID;
+  doc["ts"] = millis() / 1000UL;
+  doc["pkt"] = ++g_packet_count;
+  doc["boot"] = g_boot_count;
+
+  // Sensor 1
+  JsonObject j1 = doc.createNestedObject("s1");
+  j1["cbar"] = serialized(String(s1.cbar, 2));
+  j1["kpa"] = serialized(String(s1.kpa, 2));
+  j1["vout"] = serialized(String(s1.vout, 3));
+  j1["status"] = soil_status(s1.cbar);
+  j1["depth_cm"] = DEPTH_CM_S1;
+
+  // Sensor 2
+  JsonObject j2 = doc.createNestedObject("s2");
+  j2["cbar"] = serialized(String(s2.cbar, 2));
+  j2["kpa"] = serialized(String(s2.kpa, 2));
+  j2["vout"] = serialized(String(s2.vout, 3));
+  j2["status"] = soil_status(s2.cbar);
+  j2["depth_cm"] = DEPTH_CM_S2;
+
+  char buf[512];
+  serializeJson(doc, buf);
 
   LoRa.beginPacket();
   LoRa.print(buf);
@@ -285,117 +258,87 @@ static bool lora_send(float cbar, float vout, float kpa)
   Serial.flush();
   return ok;
 }
-
 #endif // ENABLE_LORA
 
 // ════════════════════════════════════════════════════════════
-//  Setup
+//  Enter Deep Sleep
+// ════════════════════════════════════════════════════════════
+static void go_to_sleep()
+{
+  Serial.printf("[SLP] ไปนอน %llu วินาที... (boot #%lu)\r\n",
+                SLEEP_DURATION_S, g_boot_count);
+  Serial.flush();
+  delay(100); // ให้ Serial flush ก่อน
+
+#if ENABLE_LORA
+  LoRa.sleep(); // ลด current draw ของ LoRa module
+  delay(10);
+#endif
+
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_S * 1000000ULL); // microseconds
+  esp_deep_sleep_start();
+  // ← code ไม่ถึงจุดนี้ — ESP32 reset เมื่อตื่น
+}
+
+// ════════════════════════════════════════════════════════════
+//  Setup  (= main program เพราะใช้ deep sleep)
 // ════════════════════════════════════════════════════════════
 void setup()
 {
   Serial.begin(115200);
-  delay(1000); // wait for USB-Serial to stabilise on host side
-  Serial.flush();
-  Serial.println("\r\n=== Tensiometer ESP32 Boot ===");
+  delay(500);
   Serial.flush();
 
-  // ── ADC ───────────────────────────────────────────────────
-  // Configure BEFORE SPI/LoRa so ADC mux does not interfere with SPI bus
+  g_boot_count++;
+
+  // บอกเหตุผลการตื่น
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_TIMER)
+    Serial.printf("\r\n=== ตื่นจาก Deep Sleep (boot #%lu) ===\r\n", g_boot_count);
+  else
+    Serial.printf("\r\n=== Boot ครั้งแรก / Power-on (boot #%lu) ===\r\n", g_boot_count);
+  Serial.flush();
+
+  // ── ADC Config ────────────────────────────────────────────
   analogSetAttenuation(ADC_ATTEN);
-  analogSetPinAttenuation(ADC_PIN, ADC_ATTEN);
-  Serial.printf("[ADC] Pin %d configured, 11dB atten, using analogReadMilliVolts()\r\n",
-                ADC_PIN);
+  analogSetPinAttenuation(ADC_PIN_S1, ADC_ATTEN);
+  analogSetPinAttenuation(ADC_PIN_S2, ADC_ATTEN);
+  delay(50); // settle
+
+  // ── อ่าน Sensor ทั้งสอง ───────────────────────────────────
+  Serial.println("[SENS] กำลังอ่านค่า...");
   Serial.flush();
-  delay(100); // settle ADC before touching SPI
 
+  SensorReading r1 = read_sensor(ADC_PIN_S1, ZERO_OFFSET_S1, &g_ema_s1);
+  SensorReading r2 = read_sensor(ADC_PIN_S2, ZERO_OFFSET_S2, &g_ema_s2);
+
+  // ── Serial Debug ───────────────────────────────────────────
+  Serial.printf("[S1 @%dcm] Vout=%.3fV  Vacuum=%.2fkPa  Raw=%.2fcbar  EMA=%.2fcbar  [%s]\r\n",
+                DEPTH_CM_S1, r1.vout, r1.kpa, r1.tension, r1.cbar, soil_status(r1.cbar));
+  Serial.printf("[S2 @%dcm] Vout=%.3fV  Vacuum=%.2fkPa  Raw=%.2fcbar  EMA=%.2fcbar  [%s]\r\n",
+                DEPTH_CM_S2, r2.vout, r2.kpa, r2.tension, r2.cbar, soil_status(r2.cbar));
+  Serial.flush();
+
+  // ── LoRa Transmit ──────────────────────────────────────────
 #if ENABLE_LORA
-  // ── LoRa ────────────────────────────────────────────────
-  SPI.begin();
-  delay(100);
-  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
-
-  bool lora_ok = false;
-  for (uint8_t attempt = 1; attempt <= 5; attempt++)
+  if (lora_init())
   {
-    Serial.printf("[LoRa] Init attempt %d/5...\r\n", attempt);
-    Serial.flush();
-    if (LoRa.begin(LORA_FREQUENCY))
-    {
-      lora_ok = true;
-      break;
-    }
+    delay(500);
+    lora_send(r1, r2);
     delay(500);
   }
-  if (!lora_ok)
+  else
   {
-    Serial.println("[LoRa] INIT FAILED — check wiring!\r\n"
-                   "       NSS=5 MOSI=23 MISO=19 SCK=18 RST=14 DIO0=26");
+    Serial.println("[ERR] LoRa failed — skip TX, going to sleep anyway");
     Serial.flush();
-    while (true)
-      delay(1000);
   }
-  LoRa.setSpreadingFactor(LORA_SF);
-  LoRa.setSignalBandwidth(LORA_BW);
-  LoRa.setCodingRate4(LORA_CR);
-  LoRa.setTxPower(LORA_TX_POWER);
-  LoRa.setSyncWord(0xF3);
-  Serial.printf("[LoRa] Ready @ %.0f MHz  SF%d  BW%.0fkHz\r\n",
-                LORA_FREQUENCY / 1e6, LORA_SF, LORA_BW / 1e3);
-  Serial.flush();
 #else
-  Serial.println("[LoRa] Disabled (ENABLE_LORA=0) — Serial output only\r\n");
+  Serial.println("[LoRa] Disabled — Serial only");
   Serial.flush();
-#endif // ENABLE_LORA
+#endif
 
-  Serial.println("[SYS] Entering main loop...\r\n");
-  Serial.flush();
+  // ── Deep Sleep ─────────────────────────────────────────────
+  go_to_sleep();
 }
 
-// ════════════════════════════════════════════════════════════
-//  Main Loop
-// ════════════════════════════════════════════════════════════
-void loop()
-{
-  uint32_t now = millis();
-
-  // ── Sensor sampling ─────────────────────────────────────
-  if (now - g_last_sample_ms >= SAMPLE_INTERVAL_MS)
-  {
-    g_last_sample_ms = now;
-
-    // 1. Read & filter ADC → Vout
-    float vout = read_adc_voltage();
-
-    // 2. Convert to pressure — returns NEGATIVE kPa (vacuum)
-    float kpa = voltage_to_kpa(vout);
-
-    // 3. Soil tension = absolute value (positive cbar)
-    //    e.g. kpa=-25.0 → tension=25.0 cbar
-    float tension = fabsf(kpa);
-
-    // 4. EMA smoothing on soil tension (positive cbar)
-    float cbar = ema_update(tension);
-    g_last_cbar = cbar;
-
-    // 5. Serial debug — \r\n for compatibility with all serial monitors
-    Serial.printf("[SENS] Vout=%.3fV  Vacuum=%.2fkPa  Tension=%.2fcbar  EMA=%.2fcbar  [%s]\r\n",
-                  vout, kpa, tension, cbar, soil_status(cbar));
-    Serial.flush();
-  }
-
-#if ENABLE_LORA
-  // ── LoRa transmit ──────────────────────────────────────
-  if (now - g_last_lora_ms >= LORA_SEND_INTERVAL)
-  {
-    g_last_lora_ms = now;
-    float vout = read_adc_voltage();
-    float kpa = voltage_to_kpa(vout);
-    float tension = fabsf(kpa);
-    lora_send(g_last_cbar, vout, tension);
-    delay(50);
-  }
-#endif // ENABLE_LORA
-
-  // ── Small yield delay ───────────────────────────────────
-  delay(10);
-}
+void loop() {}

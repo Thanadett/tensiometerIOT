@@ -6,121 +6,51 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-void sendToSheet(String id, int ts, int pkt, float cbar, float kpa, float vout, String status);
-
 // ================= WiFi =================
 const char *ssid = "@JumboPlusIoT";
 const char *password = "tensiometer";
 
 // ================= Google Script =================
-const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzfP2i5CG9oVMwXx1hXi_opYPGzq0RWdhc-TvGWAeMijKWAuSNJytxU-CSdVqTmjMH7Mw/exec";
+const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxB0l8vtvqO2a5xWqnrvRsnS9TT5EfIAhN8Wol4OwmHVbiLVbZR22oJ5vm2CHvDT-qm8A/exec";
 
 // ================= LoRa =================
 #define SS 5
 #define RST 14
 #define DIO0 26
 
-// ================= SETUP =================
-void setup()
+// ================= WiFi Connect =================
+bool ensureWiFi()
 {
-  Serial.begin(115200);
+  if (WiFi.status() == WL_CONNECTED)
+    return true;
 
-  // ----- WiFi -----
-  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
   WiFi.begin(ssid, password);
 
-  Serial.print("Connecting WiFi");
-  unsigned long start = millis();
+  Serial.print("[WiFi] Connecting");
+  unsigned long t = millis();
 
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
+  while (WiFi.status() != WL_CONNECTED)
   {
+    if (millis() - t > 10000)
+    {
+      Serial.println(" FAIL");
+      return false;
+    }
     delay(500);
     Serial.print(".");
   }
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\nWiFi Connected");
-  }
-  else
-  {
-    Serial.println("\nWiFi FAILED");
-  }
-
-  // ----- LoRa -----
-  SPI.begin();
-  LoRa.setPins(SS, RST, DIO0);
-
-  if (!LoRa.begin(433E6))
-  {
-    Serial.println("❌ LoRa init failed");
-    while (1)
-      ;
-  }
-
-  LoRa.setSpreadingFactor(10);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setTxPower(17);
-  LoRa.setSyncWord(0xF3); // 🔥 สำคัญ
-
-  Serial.println("✅ Receiver Ready");
+  Serial.println(" OK");
+  return true;
 }
 
-// ================= LOOP =================
-void loop()
-{
-  int packetSize = LoRa.parsePacket();
-
-  if (packetSize)
-  {
-    String received = "";
-
-    while (LoRa.available())
-    {
-      received += (char)LoRa.read();
-    }
-
-    Serial.println("📡 Received:");
-    Serial.println(received);
-
-    // -------- Parse JSON --------
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, received);
-
-    if (err)
-    {
-      Serial.println("❌ JSON Parse Failed");
-      return;
-    }
-
-    // -------- Extract values --------
-    String id = doc["id"];
-    int ts = doc["ts"];
-    int pkt = doc["pkt"];
-    float cbar = doc["cbar"].as<float>();
-    float kpa = doc["kpa"].as<float>();
-    float vout = doc["vout"].as<float>();
-    String status = doc["status"];
-
-    Serial.println("---- Parsed ----");
-    Serial.println(id);
-    Serial.println(cbar);
-    Serial.println(status);
-
-    // -------- Send to Google Sheet --------
-    sendToSheet(id, ts, pkt, cbar, kpa, vout, status);
-  }
-
-  delay(10);
-}
-
-// ================= HTTP POST =================
-void sendToSheet(String id, int ts, int pkt, float cbar, float kpa, float vout, String status)
+// ================= SEND TO SHEET =================
+void sendToSheet(JsonDocument &doc)
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("WiFi lost, reconnecting...");
-    WiFi.reconnect();
+    WiFi.begin(ssid, password);
     delay(2000);
     return;
   }
@@ -129,29 +59,93 @@ void sendToSheet(String id, int ts, int pkt, float cbar, float kpa, float vout, 
   client.setInsecure();
 
   HTTPClient http;
+
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
+
+  String id = doc["id"] | "unknown";
+  int pkt = doc["pkt"] | 0;
+
+  JsonObject s1 = doc["s1"];
+  JsonObject s2 = doc["s2"];
 
   String url = String(SCRIPT_URL) +
                "?id=" + id +
-               "&ts=" + String(ts) +
                "&pkt=" + String(pkt) +
-               "&cbar=" + String(cbar, 2) +
-               "&kpa=" + String(kpa, 2) +
-               "&vout=" + String(vout, 3) +
-               "&status=" + status;
 
-  Serial.println("📤 GET:");
+               "&s1_cbar=" + String((float)s1["cbar"], 2) +
+               "&s1_kpa=" + String((float)s1["kpa"], 2) +
+               "&s1_status=" + String((const char *)s1["status"]) +
+
+               "&s2_cbar=" + String((float)s2["cbar"], 2) +
+               "&s2_kpa=" + String((float)s2["kpa"], 2) +
+               "&s2_status=" + String((const char *)s2["status"]);
+
+  Serial.println("SEND:");
   Serial.println(url);
 
   http.begin(client, url);
+  http.addHeader("Connection", "close");
 
-  int httpCode = http.GET();
+  int code = http.GET();
 
-  Serial.print("HTTP Response: ");
-  Serial.println(httpCode);
+  Serial.print("HTTP: ");
+  Serial.println(code);
 
   String payload = http.getString();
   Serial.println(payload);
 
   http.end();
+}
+
+// ================= SETUP =================
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+
+  SPI.begin();
+  LoRa.setPins(SS, RST, DIO0);
+
+  if (!LoRa.begin(433E6))
+  {
+    Serial.println("LoRa fail");
+    while (1)
+      ;
+  }
+
+  LoRa.setSpreadingFactor(10);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setSyncWord(0xF3);
+
+  Serial.println("Ready");
+}
+
+// ================= LOOP =================
+void loop()
+{
+  int size = LoRa.parsePacket();
+
+  if (size)
+  {
+    String raw = "";
+
+    while (LoRa.available())
+      raw += (char)LoRa.read();
+
+    Serial.println("RX:");
+    Serial.println(raw);
+
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, raw))
+    {
+      Serial.println("JSON ERROR");
+      return;
+    }
+
+    sendToSheet(doc);
+  }
+
+  delay(10);
 }
