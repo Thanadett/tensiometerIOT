@@ -18,7 +18,7 @@
 
 // ─── ADC ─────────────────────────────────────────────────────
 #define ADC_ATTEN ADC_11db // 0–3.6V range
-#define VDIV_RATIO 1.667f  // Vout voltage divider
+#define VDIV_RATIO 1.50f   // Vout voltage divider
 
 // ─── MPX5050 Transfer Function ──────────────────────────────
 #define MPX_VOUT_MIN 0.20f // V ที่ 0 kPa
@@ -26,8 +26,8 @@
 #define MPX_P_MAX 50.0f    // kPa full scale
 
 // ─── Calibration (ตั้งค่าแยกสำหรับแต่ละตัว) ────────────────
-#define ZERO_OFFSET_S1 0.037f // ← sensor ตัวที่ 1
-#define ZERO_OFFSET_S2 0.037f // ← sensor ตัวที่ 2
+#define ZERO_OFFSET_S1 0.013f // ← sensor ตัวที่ 1
+#define ZERO_OFFSET_S2 0.033f // ← sensor ตัวที่ 2
 
 // ─── ความลึกของ Sensor ──────────────────────────────────────
 #define DEPTH_CM_S1 40 // cm
@@ -39,7 +39,7 @@
 #define OUTLIER_SIGMA 2.5f // ตัดค่า outlier เกิน N×σ
 
 // ─── Timing ─────────────────────────────────────────────────
-#define SLEEP_DURATION_S 3600ULL // วินาที (1 ชั่วโมง)
+#define SLEEP_DURATION_S 300ULL // วินาที (5 นาที)
 
 // ─── LoRa Settings ──────────────────────────────────────────
 #define LORA_FREQUENCY 433E6

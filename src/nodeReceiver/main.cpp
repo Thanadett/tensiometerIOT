@@ -11,7 +11,7 @@ const char *ssid = "@JumboPlusIoT";
 const char *password = "tensiometer";
 
 // ================= Google Script =================
-const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxB0l8vtvqO2a5xWqnrvRsnS9TT5EfIAhN8Wol4OwmHVbiLVbZR22oJ5vm2CHvDT-qm8A/exec";
+const char *SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzTYjY1S5XtG9U1DtGI-ya6R1pYr1D0v0JqZn3wluoiE5D1c9sxSLqJOgVUx2t2hhYVHg/exec";
 
 // ================= LoRa =================
 #define SS 5
@@ -46,7 +46,7 @@ bool ensureWiFi()
 }
 
 // ================= SEND TO SHEET =================
-void sendToSheet(JsonDocument &doc)
+void sendToSheet(JsonDocument &doc, int rssiVal)
 {
   if (WiFi.status() != WL_CONNECTED)
   {
@@ -72,6 +72,7 @@ void sendToSheet(JsonDocument &doc)
   String url = String(SCRIPT_URL) +
                "?id=" + id +
                "&pkt=" + String(pkt) +
+               "&rssi=" + String(rssiVal) +
 
                "&s1_cbar=" + String((float)s1["cbar"], 2) +
                "&s1_kpa=" + String((float)s1["kpa"], 2) +
@@ -129,6 +130,8 @@ void loop()
 
   if (size)
   {
+    int currentRssi = LoRa.packetRssi();
+
     String raw = "";
 
     while (LoRa.available())
@@ -144,7 +147,7 @@ void loop()
       return;
     }
 
-    sendToSheet(doc);
+    sendToSheet(doc, currentRssi);
   }
 
   delay(10);
